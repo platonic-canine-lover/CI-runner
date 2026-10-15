@@ -188,9 +188,15 @@ ci-runner -once
 ```
 
 That suits cron, a systemd timer, or a launchd agent — see
-[`docs/launchd.md`](docs/launchd.md). Exit status reflects whether the
-runner worked, not whether the build passed: a failing suite is reported
-to GitHub, which is where you would look for it.
+[`docs/launchd.md`](docs/launchd.md).
+
+**Exit status says whether the RUNNER worked, not whether the build
+passed.** It exits non-zero when GitHub could not be reached, the branch
+was not found, or the runner itself broke — things that need your
+attention because nothing was verified. A red build exits 0: that result
+was reported to the commit, which is where you would look for it. So a
+scheduler alerting on non-zero exits tells you "CI did not run" and stays
+quiet for "CI ran and the tests failed".
 
 ## Running it
 

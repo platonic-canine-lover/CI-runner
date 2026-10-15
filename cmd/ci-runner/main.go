@@ -179,10 +179,9 @@ func main() {
 		log.Fatalf("state: %v", err)
 	}
 
-	// The test database lives beside the state file, and better-sqlite3
-	// refuses to create a database in a directory that does not exist —
-	// found by the first smoke run, which failed at db-init on a clean
-	// machine rather than on anything to do with the commit under test.
+	// Create the service's own directory up front: a steps file that puts a
+	// database or a fixture under it should not fail on a clean machine for
+	// want of a parent directory, which is how the first real run failed.
 	home, _ := os.UserHomeDir()
 	if err := os.MkdirAll(filepath.Join(home, ".ci-runner"), 0o755); err != nil {
 		log.Fatalf("work dir: %v", err)
@@ -208,7 +207,13 @@ func main() {
 
 	if *once {
 		log.Printf("ci-runner: %s as %s, one pass, logs in %s", cfg.Repo, who, cfg.LogDir)
-		svc.pass(ctx)
+		if err := svc.pass(ctx); err != nil {
+			// Exit non-zero so a scheduler can tell "CI did not run" from
+			// "CI ran and the build was red" — the first needs attention,
+			// the second is already on the commit.
+			log.Printf("ci-runner: pass failed: %v", err)
+			os.Exit(1)
+		}
 		log.Printf("ci-runner: done")
 		return
 	}
@@ -227,22 +232,32 @@ func main() {
 func (s *service) loop(ctx context.Context) {
 	tick := time.NewTicker(s.cfg.Interval)
 	defer tick.Stop()
-	s.pass(ctx) // don't wait a full interval for the first build
+	if err := s.pass(ctx); err != nil { // don't wait a full interval for the first build
+		log.Printf("pass: %v", err)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			s.pass(ctx)
+			if err := s.pass(ctx); err != nil {
+				log.Printf("pass: %v", err) // the daemon keeps polling
+			}
 		}
 	}
 }
 
-func (s *service) pass(ctx context.Context) {
+// pass returns an error when the RUNNER could not do its job — GitHub
+// unreachable, the branch not found. A red build is not an error here: it
+// was reported to GitHub, which is where it belongs. The distinction is
+// what makes -once's exit status meaningful to cron or launchd.
+func (s *service) pass(ctx context.Context) error {
 	var work []forge.Commit
+	var failure error
 
 	if head, err := s.gh.BranchHead(ctx, s.cfg.Branch); err != nil {
 		log.Printf("%s: %v", s.cfg.Branch, err)
+		failure = fmt.Errorf("branch %s: %w", s.cfg.Branch, err)
 	} else {
 		work = append(work, head)
 	}
@@ -253,6 +268,9 @@ func (s *service) pass(ctx context.Context) {
 		// only when the listing succeeded, or an empty result would drop
 		// every pull request from state and rebuild them all next pass.
 		log.Printf("pulls: %v", err)
+		if failure == nil {
+			failure = fmt.Errorf("listing pull requests: %w", err)
+		}
 	} else {
 		keep := map[string]bool{}
 		for _, pr := range prs {
@@ -285,16 +303,19 @@ func (s *service) pass(ctx context.Context) {
 
 	for _, c := range work {
 		if ctx.Err() != nil {
-			return
+			return ctx.Err()
 		}
 		if s.store.Built(c.Ref, c.SHA) {
 			continue
 		}
-		s.build(ctx, c)
+		if err := s.build(ctx, c); err != nil && failure == nil {
+			failure = err
+		}
 	}
+	return failure
 }
 
-func (s *service) build(ctx context.Context, c forge.Commit) {
+func (s *service) build(ctx context.Context, c forge.Commit) error {
 	s.mu.Lock()
 	s.busy = true
 	s.mu.Unlock()
@@ -315,7 +336,7 @@ func (s *service) build(ctx context.Context, c forge.Commit) {
 		// as "error" rather than "failure", which means a red test suite.
 		log.Printf("runner: %v", err)
 		_ = s.gh.SetStatus(ctx, c.SHA, forge.StateError, checkName, "runner error: "+err.Error())
-		return
+		return fmt.Errorf("build %s: %w", short(c.SHA), err)
 	}
 
 	state, desc := forge.StateSuccess, fmt.Sprintf("passed in %s", res.Duration.Round(time.Second))
@@ -336,7 +357,7 @@ func (s *service) build(ctx context.Context, c forge.Commit) {
 	// ever, with the commit marked built and never retried.
 	if ctx.Err() != nil {
 		log.Printf("%s %s: interrupted — not recorded, it will be retried", c.Ref, short(c.SHA))
-		return
+		return ctx.Err()
 	}
 	if err := s.store.Record(c.Ref, c.SHA); err != nil {
 		log.Printf("state: %v", err)
@@ -347,10 +368,12 @@ func (s *service) build(ctx context.Context, c forge.Commit) {
 		At: time.Now(), Duration: res.Duration.Round(time.Second).String(), LogPath: res.LogPath,
 	}
 	s.mu.Unlock()
+	return nil
 }
 
-// serve exposes a loopback status endpoint — the same posture as the
-// bot's own dashboards. Nothing here is a control surface: it only reads.
+// serve exposes a loopback status endpoint. Nothing here is a control
+// surface: it only reads, and it binds to localhost, so the service can be
+// asked how it is getting on without being exposed to anything.
 func (s *service) serve(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {

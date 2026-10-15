@@ -129,7 +129,12 @@ func (c *Client) OpenPullRequests(ctx context.Context) ([]Commit, error) {
 			PullNum: pr.Number,
 			// A deleted head repo reports an empty name; treat the unknown
 			// case as a fork, because the safe default is not to run it.
-			Fork: pr.Head.Repo.FullName != c.repo,
+			// Case-insensitive: GitHub returns the canonical spelling of a
+			// repository, and the API accepts any case in a request, so a
+			// CI_REPO of "owner/ci-runner" against a canonical
+			// "owner/CI-runner" would otherwise mark every one of your own
+			// pull requests a fork and never build them.
+			Fork: !strings.EqualFold(pr.Head.Repo.FullName, c.repo),
 		})
 	}
 	return commits, nil
@@ -145,8 +150,8 @@ const (
 	StateError   State = "error"
 )
 
-// SetStatus reports a result against a commit. Context is the check's name
-// as it appears in the GitHub UI, e.g. "warburton-ci/test".
+// SetStatus reports a result against a commit. checkName is the name as it
+// appears in the GitHub UI, e.g. "ci-runner".
 func (c *Client) SetStatus(ctx context.Context, sha string, state State, checkName, description string) error {
 	// GitHub truncates descriptions at 140 characters and rejects nothing,
 	// so trim here rather than discover it as a silently shortened message.

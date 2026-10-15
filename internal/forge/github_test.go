@@ -87,6 +87,27 @@ func TestPullRequestsFromForksAreMarked(t *testing.T) {
 	}
 }
 
+func TestForkCheckIgnoresCase(t *testing.T) {
+	// GitHub returns the canonical spelling; CI_REPO may be typed in any
+	// case because the API accepts it. Comparing exactly would mark your
+	// own pull requests as forks and never build them — and this
+	// repository's own name has capitals in it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `[{"number":1,"title":"ours","head":{"sha":"aaa","repo":{"full_name":"Owner/CI-Runner"}}}]`)
+	}))
+	t.Cleanup(srv.Close)
+	c := New("test-token", "owner/ci-runner") // configured in lower case
+	c.base = srv.URL
+
+	prs, err := c.OpenPullRequests(context.Background())
+	if err != nil {
+		t.Fatalf("OpenPullRequests: %v", err)
+	}
+	if prs[0].Fork {
+		t.Error("a differently-cased spelling of our own repository is not a fork")
+	}
+}
+
 func TestSetStatusTruncatesLongDescriptions(t *testing.T) {
 	// GitHub silently shortens descriptions past 140 characters; better to
 	// send something we chose than discover a sentence cut mid-word.
