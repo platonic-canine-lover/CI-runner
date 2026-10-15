@@ -1,0 +1,5 @@
+# Built binary
+/ci-runner
+
+# Local runner state, if anyone points the defaults here
+/.ci-runner/

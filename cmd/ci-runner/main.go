@@ -1,0 +1,354 @@
+// ci-runner runs a repository's test suite on a machine you control and
+// reports the result to GitHub as a commit status.
+//
+// Why it exists: hosted CI can stop for reasons that have nothing to do
+// with your code — a lapsed payment, an exhausted quota, an outage — and
+// the repository goes on looking the same while nothing is actually being
+// verified. A runner on hardware you already own does not share that
+// failure mode, and costs nothing per minute.
+//
+// Why not a self-hosted GitHub Actions runner: that executes whatever
+// workflow YAML a branch contains. If the machine also runs anything you
+// care about, that is a wide door. This runs only the steps compiled into
+// it, against a checkout in its own directory. Less capable on purpose.
+//
+// It polls rather than receiving webhooks. Polling needs no inbound
+// network exposure at all, which suits a machine behind a domestic router
+// or a host whose services deliberately bind to loopback. The HTTP server
+// here is loopback-only too, and only reads: it exists so the service can
+// be asked how it is getting on.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/platonic-canine-lover/CI-runner/internal/forge"
+	"github.com/platonic-canine-lover/CI-runner/internal/runner"
+	"github.com/platonic-canine-lover/CI-runner/internal/state"
+)
+
+const checkName = "ci-runner"
+
+type config struct {
+	Repo     string
+	Token    string
+	WorkDir  string
+	LogDir   string
+	StateF   string
+	StepsF   string
+	Interval time.Duration
+	Timeout  time.Duration
+	Listen   string
+}
+
+func loadConfig() (config, error) {
+	home, _ := os.UserHomeDir()
+	c := config{
+		Repo:     env("CI_REPO", ""),
+		Token:    os.Getenv("CI_GITHUB_TOKEN"),
+		WorkDir:  env("CI_WORKDIR", filepath.Join(home, ".ci-runner", "checkout")),
+		LogDir:   env("CI_LOGDIR", filepath.Join(home, ".ci-runner", "logs")),
+		StateF:   env("CI_STATE", filepath.Join(home, ".ci-runner", "state.json")),
+		StepsF:   os.Getenv("CI_STEPS"),
+		Interval: envDuration("CI_INTERVAL", 2*time.Minute),
+		Timeout:  envDuration("CI_TIMEOUT", 25*time.Minute),
+		Listen:   env("CI_LISTEN", "127.0.0.1:3101"),
+	}
+	if c.Token == "" {
+		// Fall back to the gh CLI's token, which is already on this machine
+		// with the right scopes — one less secret to copy into a plist.
+		if out, err := exec.Command("gh", "auth", "token").Output(); err == nil {
+			c.Token = strings.TrimSpace(string(out))
+		}
+	}
+	if c.Token == "" {
+		return c, fmt.Errorf("no token: set CI_GITHUB_TOKEN, or log in with the gh CLI")
+	}
+	if c.Repo == "" {
+		return c, fmt.Errorf("set CI_REPO to the repository to build, as owner/name")
+	}
+	return c, nil
+}
+
+// defaultSteps is what an unconfigured Node project almost certainly
+// wants. Anything else comes from a steps file — see loadSteps.
+func defaultSteps() []runner.Step {
+	return []runner.Step{
+		{Name: "install", Args: []string{"npm", "ci", "--no-audit", "--no-fund"}},
+		{Name: "test", Args: []string{"npm", "test"}},
+	}
+}
+
+// loadSteps reads a JSON steps file:
+//
+//	[
+//	  {"name": "install", "args": ["npm", "ci"]},
+//	  {"name": "test",    "args": ["npm", "test"], "env": ["TEST_DB=/tmp/t.db"]}
+//	]
+//
+// JSON rather than YAML so the binary keeps no dependencies, and argv
+// rather than a command string so nothing is word-split or shell-expanded:
+// a step cannot accidentally become two, and a path with a space in it
+// behaves.
+func loadSteps(path string) ([]runner.Step, error) {
+	if path == "" {
+		return defaultSteps(), nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("steps file: %w", err)
+	}
+	var steps []runner.Step
+	if err := json.Unmarshal(b, &steps); err != nil {
+		return nil, fmt.Errorf("steps file %s: %w", path, err)
+	}
+	if len(steps) == 0 {
+		return nil, fmt.Errorf("steps file %s defines no steps", path)
+	}
+	for i, st := range steps {
+		if st.Name == "" || len(st.Args) == 0 {
+			return nil, fmt.Errorf("steps file %s: step %d needs a name and args", path, i)
+		}
+	}
+	return steps, nil
+}
+
+type service struct {
+	cfg   config
+	gh    *forge.Client
+	run   *runner.Runner
+	store *state.Store
+	mu    sync.Mutex
+	last  buildInfo
+	busy  bool
+}
+
+type buildInfo struct {
+	Ref      string    `json:"ref"`
+	SHA      string    `json:"sha"`
+	OK       bool      `json:"ok"`
+	Failed   string    `json:"failed_step,omitempty"`
+	At       time.Time `json:"at"`
+	Duration string    `json:"duration"`
+	LogPath  string    `json:"log"`
+}
+
+func main() {
+	log.SetFlags(log.Ldate | log.Ltime)
+
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	gh := forge.New(cfg.Token, cfg.Repo)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Fail at boot on a bad token rather than on the first status write.
+	who, err := gh.Whoami(ctx)
+	if err != nil {
+		log.Fatalf("github: %v", err)
+	}
+
+	store, err := state.Open(cfg.StateF)
+	if err != nil {
+		log.Fatalf("state: %v", err)
+	}
+
+	// The test database lives beside the state file, and better-sqlite3
+	// refuses to create a database in a directory that does not exist —
+	// found by the first smoke run, which failed at db-init on a clean
+	// machine rather than on anything to do with the commit under test.
+	home, _ := os.UserHomeDir()
+	if err := os.MkdirAll(filepath.Join(home, ".ci-runner"), 0o755); err != nil {
+		log.Fatalf("work dir: %v", err)
+	}
+
+	buildSteps, err := loadSteps(cfg.StepsF)
+	if err != nil {
+		log.Fatalf("steps: %v", err)
+	}
+
+	svc := &service{
+		cfg:   cfg,
+		gh:    gh,
+		store: store,
+		run: &runner.Runner{
+			RepoURL: "https://github.com/" + cfg.Repo + ".git",
+			WorkDir: cfg.WorkDir,
+			LogDir:  cfg.LogDir,
+			Steps:   buildSteps,
+			Timeout: cfg.Timeout,
+		},
+	}
+
+	log.Printf("ci-runner: %s as %s, polling every %s, logs in %s",
+		cfg.Repo, who, cfg.Interval, cfg.LogDir)
+
+	go svc.serve(ctx)
+	svc.loop(ctx)
+	log.Printf("ci-runner: stopped")
+}
+
+// loop polls for work. One pass at a time, and one build at a time inside
+// a pass: the suite uses per-file test databases named after the file, so
+// two concurrent runs corrupt each other's results.
+func (s *service) loop(ctx context.Context) {
+	tick := time.NewTicker(s.cfg.Interval)
+	defer tick.Stop()
+	s.pass(ctx) // don't wait a full interval for the first build
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			s.pass(ctx)
+		}
+	}
+}
+
+func (s *service) pass(ctx context.Context) {
+	var work []forge.Commit
+
+	if head, err := s.gh.BranchHead(ctx, "main"); err != nil {
+		log.Printf("main: %v", err)
+	} else {
+		work = append(work, head)
+	}
+
+	prs, err := s.gh.OpenPullRequests(ctx)
+	if err != nil {
+		log.Printf("pulls: %v", err)
+	}
+	work = append(work, prs...)
+
+	keep := map[string]bool{}
+	for _, pr := range prs {
+		keep[pr.Ref] = true
+	}
+	s.store.Forget(keep)
+
+	for _, c := range work {
+		if ctx.Err() != nil {
+			return
+		}
+		if s.store.Built(c.Ref, c.SHA) {
+			continue
+		}
+		s.build(ctx, c)
+	}
+}
+
+func (s *service) build(ctx context.Context, c forge.Commit) {
+	s.mu.Lock()
+	s.busy = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.busy = false
+		s.mu.Unlock()
+	}()
+
+	log.Printf("building %s %s — %s", c.Ref, short(c.SHA), c.Title)
+	if err := s.gh.SetStatus(ctx, c.SHA, forge.StatePending, checkName, "running on the self-hosted runner"); err != nil {
+		log.Printf("status pending: %v", err)
+	}
+
+	res, err := s.run.Run(ctx, c.SHA)
+	if err != nil {
+		// The runner itself broke — not the build. Say so on the commit
+		// as "error" rather than "failure", which means a red test suite.
+		log.Printf("runner: %v", err)
+		_ = s.gh.SetStatus(ctx, c.SHA, forge.StateError, checkName, "runner error: "+err.Error())
+		return
+	}
+
+	state, desc := forge.StateSuccess, fmt.Sprintf("passed in %s", res.Duration.Round(time.Second))
+	if !res.OK {
+		state = forge.StateFailure
+		desc = fmt.Sprintf("%s failed after %s", res.Failed, res.Duration.Round(time.Second))
+	}
+	if err := s.gh.SetStatus(ctx, c.SHA, state, checkName, desc); err != nil {
+		log.Printf("status: %v", err)
+	}
+	log.Printf("%s %s: %s (%s)", c.Ref, short(c.SHA), desc, res.LogPath)
+
+	// Recorded whatever the outcome: a red commit should not be rebuilt
+	// every two minutes until someone pushes a fix.
+	if err := s.store.Record(c.Ref, c.SHA); err != nil {
+		log.Printf("state: %v", err)
+	}
+	s.mu.Lock()
+	s.last = buildInfo{
+		Ref: c.Ref, SHA: c.SHA, OK: res.OK, Failed: res.Failed,
+		At: time.Now(), Duration: res.Duration.Round(time.Second).String(), LogPath: res.LogPath,
+	}
+	s.mu.Unlock()
+}
+
+// serve exposes a loopback status endpoint — the same posture as the
+// bot's own dashboards. Nothing here is a control surface: it only reads.
+func (s *service) serve(ctx context.Context) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+		s.mu.Lock()
+		out := struct {
+			Repo string    `json:"repo"`
+			Busy bool      `json:"busy"`
+			Last buildInfo `json:"last_build"`
+		}{s.cfg.Repo, s.busy, s.last}
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	})
+
+	srv := &http.Server{Addr: s.cfg.Listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown)
+	}()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("http: %v", err)
+	}
+}
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return fallback
+}
+
+func short(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
