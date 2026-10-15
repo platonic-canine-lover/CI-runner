@@ -61,6 +61,32 @@ func TestOpenPullRequestsAreLabelledByNumber(t *testing.T) {
 	}
 }
 
+func TestPullRequestsFromForksAreMarked(t *testing.T) {
+	// A build step runs what the repository tells it to, so a pull request
+	// whose head lives somewhere else is somebody else's code running here.
+	c := withServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `[
+		  {"number":1,"title":"ours","head":{"sha":"aaa","repo":{"full_name":"owner/repo"}}},
+		  {"number":2,"title":"theirs","head":{"sha":"bbb","repo":{"full_name":"stranger/repo"}}},
+		  {"number":3,"title":"deleted head","head":{"sha":"ccc","repo":{}}}
+		]`)
+	})
+
+	prs, err := c.OpenPullRequests(context.Background())
+	if err != nil {
+		t.Fatalf("OpenPullRequests: %v", err)
+	}
+	if prs[0].Fork {
+		t.Error("a branch in our own repository is not a fork")
+	}
+	if !prs[1].Fork {
+		t.Error("a head in another repository is a fork")
+	}
+	if !prs[2].Fork {
+		t.Error("an unknown head repository must be treated as a fork — the safe default")
+	}
+}
+
 func TestSetStatusTruncatesLongDescriptions(t *testing.T) {
 	// GitHub silently shortens descriptions past 140 characters; better to
 	// send something we chose than discover a sentence cut mid-word.

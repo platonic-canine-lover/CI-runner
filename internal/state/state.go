@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -69,13 +70,15 @@ func (s *Store) Record(ref, sha string) error {
 	return os.Rename(tmp, s.path)
 }
 
-// Forget drops refs that no longer exist, so closed pull requests do not
-// accumulate in the file for ever.
+// Forget drops pull-request refs that are no longer open, so closed ones
+// do not accumulate for ever. Branch refs are never forgotten: only refs
+// named "pr/..." are candidates, so a configured branch of any name
+// survives regardless of what the caller passes.
 func (s *Store) Forget(keep map[string]bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for ref := range s.Seen {
-		if ref != "main" && !keep[ref] {
+		if strings.HasPrefix(ref, "pr/") && !keep[ref] {
 			delete(s.Seen, ref)
 		}
 	}

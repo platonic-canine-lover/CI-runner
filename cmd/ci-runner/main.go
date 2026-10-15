@@ -22,6 +22,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -48,6 +49,7 @@ type config struct {
 	LogDir   string
 	StateF   string
 	StepsF   string
+	Branch   string
 	Interval time.Duration
 	Timeout  time.Duration
 	Listen   string
@@ -62,6 +64,7 @@ func loadConfig() (config, error) {
 		LogDir:   env("CI_LOGDIR", filepath.Join(home, ".ci-runner", "logs")),
 		StateF:   env("CI_STATE", filepath.Join(home, ".ci-runner", "state.json")),
 		StepsF:   os.Getenv("CI_STEPS"),
+		Branch:   env("CI_BRANCH", "main"),
 		Interval: envDuration("CI_INTERVAL", 2*time.Minute),
 		Timeout:  envDuration("CI_TIMEOUT", 25*time.Minute),
 		Listen:   env("CI_LISTEN", "127.0.0.1:3101"),
@@ -148,6 +151,14 @@ type buildInfo struct {
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime)
 
+	// One pass and exit, for a scheduled run (cron, launchd, a CI step in
+	// someone else's pipeline). The daemon is the default because it is the
+	// useful mode when you want a commit checked minutes after it lands;
+	// -once is the useful mode when you want the suite run at 01:00
+	// whatever happened during the day.
+	once := flag.Bool("once", false, "run one pass over the repository and exit")
+	flag.Parse()
+
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -195,6 +206,13 @@ func main() {
 		},
 	}
 
+	if *once {
+		log.Printf("ci-runner: %s as %s, one pass, logs in %s", cfg.Repo, who, cfg.LogDir)
+		svc.pass(ctx)
+		log.Printf("ci-runner: done")
+		return
+	}
+
 	log.Printf("ci-runner: %s as %s, polling every %s, logs in %s",
 		cfg.Repo, who, cfg.Interval, cfg.LogDir)
 
@@ -223,23 +241,47 @@ func (s *service) loop(ctx context.Context) {
 func (s *service) pass(ctx context.Context) {
 	var work []forge.Commit
 
-	if head, err := s.gh.BranchHead(ctx, "main"); err != nil {
-		log.Printf("main: %v", err)
+	if head, err := s.gh.BranchHead(ctx, s.cfg.Branch); err != nil {
+		log.Printf("%s: %v", s.cfg.Branch, err)
 	} else {
 		work = append(work, head)
 	}
 
 	prs, err := s.gh.OpenPullRequests(ctx)
 	if err != nil {
+		// One API blip must not wipe what has been built: Forget below runs
+		// only when the listing succeeded, or an empty result would drop
+		// every pull request from state and rebuild them all next pass.
 		log.Printf("pulls: %v", err)
+	} else {
+		keep := map[string]bool{}
+		for _, pr := range prs {
+			keep[pr.Ref] = true
+		}
+		s.store.Forget(keep)
 	}
-	work = append(work, prs...)
 
-	keep := map[string]bool{}
 	for _, pr := range prs {
-		keep[pr.Ref] = true
+		// A pull request from a fork is somebody else's code, and a build
+		// step runs what the repository tells it to. On a public repository
+		// that is arbitrary code execution on this machine, which is the
+		// door the README claims is shut. Report it rather than silently
+		// ignoring it, so a contributor is not left waiting for a check.
+		if pr.Fork {
+			log.Printf("skipping %s — from a fork", pr.Ref)
+			if !s.store.Built(pr.Ref, pr.SHA) {
+				if err := s.gh.SetStatus(ctx, pr.SHA, forge.StateError, checkName,
+					"not built: pull requests from forks are not run on this runner"); err != nil {
+					log.Printf("status: %v", err)
+				}
+				if err := s.store.Record(pr.Ref, pr.SHA); err != nil {
+					log.Printf("state: %v", err)
+				}
+			}
+			continue
+		}
+		work = append(work, pr)
 	}
-	s.store.Forget(keep)
 
 	for _, c := range work {
 		if ctx.Err() != nil {
@@ -286,8 +328,16 @@ func (s *service) build(ctx context.Context, c forge.Commit) {
 	}
 	log.Printf("%s %s: %s (%s)", c.Ref, short(c.SHA), desc, res.LogPath)
 
-	// Recorded whatever the outcome: a red commit should not be rebuilt
-	// every two minutes until someone pushes a fix.
+	// Recorded whatever the outcome — a red commit should not be rebuilt
+	// every two minutes until someone pushes a fix — EXCEPT when the run was
+	// interrupted. A shutdown mid-build (launchd, the nightly restart) kills
+	// the step and the status write fails because the context is already
+	// cancelled; recording it then would leave GitHub showing "pending" for
+	// ever, with the commit marked built and never retried.
+	if ctx.Err() != nil {
+		log.Printf("%s %s: interrupted — not recorded, it will be retried", c.Ref, short(c.SHA))
+		return
+	}
 	if err := s.store.Record(c.Ref, c.SHA); err != nil {
 		log.Printf("state: %v", err)
 	}

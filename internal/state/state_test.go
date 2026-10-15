@@ -90,6 +90,30 @@ func TestForgetDropsClosedPullRequestsButKeepsMain(t *testing.T) {
 	}
 }
 
+func TestForgetKeepsAnyBranchRefWhateverItIsCalled(t *testing.T) {
+	// Forget used to spare the literal "main", so a runner configured with
+	// CI_BRANCH=develop would drop its own branch from state on every pass
+	// and rebuild it for ever.
+	s, err := Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for ref, sha := range map[string]string{"develop": "aaa", "release/2.0": "bbb", "pr/9": "ccc"} {
+		if err := s.Record(ref, sha); err != nil {
+			t.Fatalf("record %s: %v", ref, err)
+		}
+	}
+
+	s.Forget(map[string]bool{}) // no pull requests are open
+
+	if !s.Built("develop", "aaa") || !s.Built("release/2.0", "bbb") {
+		t.Error("branch refs must survive, whatever they are named")
+	}
+	if s.Built("pr/9", "ccc") {
+		t.Error("a closed pull request should be dropped")
+	}
+}
+
 func TestRecordWritesAtomically(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")

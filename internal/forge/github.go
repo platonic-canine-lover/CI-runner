@@ -42,7 +42,8 @@ type Commit struct {
 	SHA     string
 	Ref     string // "main", or "pr/12" for a pull request
 	Title   string
-	PullNum int // 0 when this is a branch head
+	PullNum int  // 0 when this is a branch head
+	Fork    bool // the pull request's head is in a different repository
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
@@ -110,7 +111,10 @@ func (c *Client) OpenPullRequests(ctx context.Context) ([]Commit, error) {
 		Number int    `json:"number"`
 		Title  string `json:"title"`
 		Head   struct {
-			SHA string `json:"sha"`
+			SHA  string `json:"sha"`
+			Repo struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
 		} `json:"head"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/repos/"+c.repo+"/pulls?state=open&per_page=50", nil, &out); err != nil {
@@ -123,6 +127,9 @@ func (c *Client) OpenPullRequests(ctx context.Context) ([]Commit, error) {
 			Ref:     fmt.Sprintf("pr/%d", pr.Number),
 			Title:   pr.Title,
 			PullNum: pr.Number,
+			// A deleted head repo reports an empty name; treat the unknown
+			// case as a fork, because the safe default is not to run it.
+			Fork: pr.Head.Repo.FullName != c.repo,
 		})
 	}
 	return commits, nil

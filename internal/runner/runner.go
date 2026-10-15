@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -130,7 +131,24 @@ func (r *Runner) exec(ctx context.Context, step Step, log *os.File, dirOverride 
 	}
 	cmd := exec.CommandContext(ctx, step.Args[0], step.Args[1:]...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), step.Env...)
+	// A build step gets a MINIMAL environment, not this process's. Steps run
+	// code from the repository — `npm test` runs whatever package.json says
+	// — and inheriting os.Environ() would hand that code CI_GITHUB_TOKEN
+	// and everything else in the service's environment. Only what a build
+	// genuinely needs is passed through, plus the step's own declarations.
+	cmd.Env = append(buildEnv(), step.Env...)
+
+	// Kill the whole process GROUP, not just the child we started.
+	//
+	// exec.CommandContext's default cancel kills the direct child only. A
+	// step like `npm test` that leaves a server running hands its stdout
+	// pipe to that grandchild, so Wait() blocks on the pipe long after the
+	// deadline: measured at 8.1s against a 300ms budget. Setpgid puts the
+	// step in its own group, Cancel signals the group, and WaitDelay is the
+	// backstop if something ignores SIGKILL or holds the pipe anyway.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 5 * time.Second
 
 	// Tee to both: the buffer feeds the status description, the file is
 	// the record someone reads afterwards.
@@ -143,6 +161,21 @@ func (r *Runner) exec(ctx context.Context, step Step, log *os.File, dirOverride 
 		return buf.String(), fmt.Errorf("timed out after %s", r.Timeout)
 	}
 	return buf.String(), err
+}
+
+// passThrough is what a build is allowed to see of the service's
+// environment: enough to find a toolchain and behave predictably, and
+// nothing that identifies or authorises this machine.
+var passThrough = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SHELL", "USER", "TZ"}
+
+func buildEnv() []string {
+	env := make([]string, 0, len(passThrough))
+	for _, k := range passThrough {
+		if v, ok := os.LookupEnv(k); ok {
+			env = append(env, k+"="+v)
+		}
+	}
+	return env
 }
 
 func tail(s string, n int) string {

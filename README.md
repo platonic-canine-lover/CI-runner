@@ -1,10 +1,8 @@
 # ci-runner
 
-This is my A CI runner (Continuous Integration runner), it's a worker application that executes the build, test, and deployment tasks defined in a CI/CD pipeline. (Written in Go).
-
-A small CI service in Go. It watches a GitHub repository, runs your build
-steps on a machine you control, and reports the result back as a commit
-status.
+A continuous-integration worker: it watches a GitHub repository, runs your
+build and test steps on a machine you control, and reports the result back
+as a commit status.
 
 No dependencies outside the standard library.
 
@@ -39,6 +37,31 @@ domestic router. The HTTP server it does run binds to loopback and only
 reads.
 
 Less capable on purpose, in both cases.
+
+## Security
+
+This runs build steps on your machine, so it is worth being explicit about
+what that means.
+
+**Pull requests from forks are not built.** A build step runs whatever the
+repository says — `npm test` runs the scripts in that branch's
+`package.json` — so building a stranger's branch is running their code on
+your hardware. Forks are skipped and reported on the commit as an error
+explaining why, rather than silently ignored.
+
+**Build steps do not inherit the service's environment.** They get `PATH`,
+`HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `SHELL`, `USER` and `TZ`, plus whatever
+the step declares — and nothing else. The GitHub token the service uses to
+report status never reaches a build.
+
+**Steps are what you configured, not what a branch asks for.** There is no
+workflow file in the repository that this obeys. Changing what runs means
+changing the steps file on the runner's own machine.
+
+**It is still your machine.** Your own code runs with your user's
+permissions and can reach anything that user can. On a repository where
+you trust every contributor with push access, that is the same trust you
+have already extended. If that is not true, run it as a dedicated user.
 
 ## Design notes
 
@@ -78,6 +101,7 @@ Environment variables, all optional except the repository:
 | `CI_REPO` | — | `owner/name`, required |
 | `CI_GITHUB_TOKEN` | `gh auth token` | token with `repo` scope |
 | `CI_STEPS` | a default Node build | path to a steps file |
+| `CI_BRANCH` | `main` | branch to watch |
 | `CI_INTERVAL` | `2m` | how often to look for new commits |
 | `CI_TIMEOUT` | `25m` | budget for one whole build |
 | `CI_WORKDIR` | `~/.ci-runner/checkout` | where the repository is checked out |
@@ -98,6 +122,9 @@ to copy into a service definition.
   { "name": "test",    "args": ["npm", "test"], "env": ["TEST_DB=/tmp/test.db"] }
 ]
 ```
+
+`env` is how a step gets anything beyond the minimal environment above —
+a database path, a feature flag, a fixture directory.
 
 Steps run in order in the checkout directory and stop at the first failure.
 JSON rather than YAML so the binary keeps no dependencies.
