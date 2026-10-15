@@ -102,6 +102,37 @@ to copy into a service definition.
 Steps run in order in the checkout directory and stop at the first failure.
 JSON rather than YAML so the binary keeps no dependencies.
 
+### Steps have to be idempotent
+
+This is the one thing that catches people moving from hosted CI, and it
+does not show up until the second run.
+
+A hosted runner hands you a clean machine every time, so a step can assume
+nothing exists yet. This runner reuses its checkout — deliberately, because
+re-cloning and reinstalling dependencies for every build is most of the
+wall-clock time — and the machine's `/tmp` persists too. A step that
+creates something therefore has to tolerate that thing already being
+there.
+
+The first real build here failed on exactly that:
+
+```
+ABORT: /tmp/ci-runner-warburton.db already exists. Use --force to overwrite (destructive).
+```
+
+The project's database initialiser refuses to overwrite, which is right on
+a developer's machine and wrong in a build. The fix is in the step, not the
+project:
+
+```json
+{ "name": "db-init", "args": ["node", "db/init.js", "--force"],
+  "env": ["TEST_DB=/tmp/test.db"] }
+```
+
+The same applies to anything else that survives a build: caches, generated
+files, a port left bound. Write the steps as though the last run already
+happened, because it did.
+
 ## Endpoints
 
 - `GET /healthz` — `ok`
@@ -118,6 +149,21 @@ JSON rather than YAML so the binary keeps no dependencies.
   }
 }
 ```
+
+## Scheduling it
+
+The daemon polls, which is what you want if a commit should be checked
+minutes after it lands. For "run the suite at 01:10 whatever happened
+today", use one pass and exit:
+
+```sh
+ci-runner -once
+```
+
+That suits cron, a systemd timer, or a launchd agent — see
+[`docs/launchd.md`](docs/launchd.md). Exit status reflects whether the
+runner worked, not whether the build passed: a failing suite is reported
+to GitHub, which is where you would look for it.
 
 ## Running it
 
